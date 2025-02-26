@@ -1,0 +1,182 @@
+import os
+import logging
+import time
+import numpy as np
+import pandas as pd
+import threading
+import asyncio
+import websockets
+import requests
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from dotenv import load_dotenv
+from binance.client import Client
+from kucoin.client import Client as KucoinClient
+from okx import MarketData, Trade
+from web3 import Web3
+from google.colab import auth
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+# 📌 API Anahtarlarını Güvenli Şekilde Yükle
+load_dotenv()
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+KUCOIN_API_KEY = os.getenv("KUCOIN_API_KEY")
+KUCOIN_API_SECRET = os.getenv("KUCOIN_API_SECRET")
+OKX_API_KEY = os.getenv("OKX_API_KEY")
+OKX_API_SECRET = os.getenv("OKX_API_SECRET")
+ALCHEMY_ETH_API_KEY = os.getenv("ALCHEMY_ETH_API_KEY")
+INFURA_API_KEY = os.getenv("INFURA_API_KEY")
+THE_GRAPH_API_URL = os.getenv("THE_GRAPH_API_URL")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# 📌 Binance, KuCoin ve OKX Bağlantıları
+binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+kucoin_client = KucoinClient(KUCOIN_API_KEY, KUCOIN_API_SECRET)
+okx_market = MarketData(OKX_API_KEY, OKX_API_SECRET)
+okx_trade = Trade(OKX_API_KEY, OKX_API_SECRET)
+
+# 📌 Blockchain API Bağlantıları
+w3_alchemy = Web3(Web3.HTTPProvider(f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_ETH_API_KEY}"))
+w3_infura = Web3(Web3.HTTPProvider(f"https://mainnet.infura.io/v3/{INFURA_API_KEY}"))
+
+# 📌 Google Drive Kimlik Doğrulama
+auth.authenticate_user()
+drive_service = build('drive', 'v3')
+
+# 📌 API Failover Mekanizması (Alchemy & Infura)
+def get_blockchain_data():
+    if w3_alchemy.is_connected():
+        logging.info("✅ Alchemy API'den blok verisi çekiliyor...")
+        return w3_alchemy.eth.get_block("latest")
+    elif w3_infura.is_connected():
+        logging.info("🔄 Alchemy API başarısız oldu, Infura API'den blok verisi çekiliyor...")
+        return w3_infura.eth.get_block("latest")
+    else:
+        logging.error("❌ Hem Alchemy hem de Infura API başarısız oldu!")
+        return None
+
+# 📌 The Graph API ile On-Chain Analiz
+def get_graph_data():
+    query = """
+    {
+      transfers(first: 5) {
+        id
+        from
+        to
+        value
+      }
+    }
+    """
+    response = requests.post(THE_GRAPH_API_URL, json={"query": query})
+    if response.status_code == 200:
+        return response.json()
+    else:
+        logging.error(f"❌ The Graph API başarısız! {response.text}")
+        return None
+
+# 📌 AI Modeli (LSTM)
+class LSTMPredictor(nn.Module):
+    def __init__(self, input_size=1, hidden_layer_size=50, output_size=1):
+        super().__init__()
+        self.hidden_layer_size = hidden_layer_size
+        self.lstm = nn.LSTM(input_size, hidden_layer_size, batch_first=True)
+        self.linear = nn.Linear(hidden_layer_size, output_size)
+
+    def forward(self, input_seq):
+        lstm_out, _ = self.lstm(input_seq)
+        predictions = self.linear(lstm_out[:, -1])
+        return predictions
+
+# 📌 AI Modelini Eğitme
+def train_ai_model():
+    data = pd.read_csv("market_data.csv")
+    X = torch.tensor(data['feature'].values, dtype=torch.float32)
+    y = torch.tensor(data['target'].values, dtype=torch.float32)
+
+    model = LSTMPredictor()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    loss_function = nn.MSELoss()
+
+    for epoch in range(10):
+        optimizer.zero_grad()
+        output = model(X)
+        loss = loss_function(output, y)
+        loss.backward()
+        optimizer.step()
+
+    torch.save(model.state_dict(), "ai_model.pth")
+    logging.info("✅ AI Modeli Güncellendi!")
+    return model
+
+# 📌 WebSocket Bağlantısı Başlatma
+async def websocket_listener(exchange, symbol):
+    uris = {
+        "binance": f"wss://stream.binance.com:9443/ws/{symbol.lower()}@trade",
+        "kucoin": f"wss://ws-api.kucoin.com/endpoint",
+        "okx": f"wss://ws.okx.com:8443/ws/v5/public"
+    }
+    uri = uris.get(exchange, "")
+
+    while True:
+        try:
+            async with websockets.connect(uri) as websocket:
+                while True:
+                    message = await websocket.recv()
+                    print(f"📡 {exchange.upper()} | {symbol}: {message}")
+        except Exception as e:
+            logging.error(f"WebSocket bağlantısında hata: {e}. 5 saniye sonra yeniden bağlanılıyor...")
+            await asyncio.sleep(5)
+
+# 📌 Telegram Uyarı Sistemi
+def send_telegram_alert(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+    try:
+        requests.post(url, data=data)
+    except Exception as e:
+        logging.error(f"Telegram uyarısı gönderilirken hata: {e}")
+
+# 📌 Google Drive'a Veri Kaydetme
+def save_to_drive(content, filename="trading_data.txt"):
+    filepath = f"/content/{filename}"
+    with open(filepath, "w") as file:
+        file.write(content)
+    file_metadata = {'name': filename, 'parents': ['binance pump']}
+    media = MediaFileUpload(filepath, mimetype='text/plain')
+    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+    logging.info(f"📁 {filename} Google Drive'a kaydedildi.")
+
+# 📌 Çoklu İşlem Açma (KuCoin & OKX)
+def send_order(symbol, side, quantity, price, exchange):
+    api_url = "https://api.kucoin.com/api/v1/orders" if exchange == "kucoin" else "https://www.okx.com/api/v5/trade/order"
+    order_data = {"symbol": symbol, "side": side, "quantity": quantity, "price": price}
+    response = requests.post(api_url, json=order_data)
+    return response.json()
+
+# 📌 Ana Çalıştırma
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    # WebSocket Bağlantıları
+    symbols = ["BTCUSDT", "ETHUSDT"]
+    for symbol in symbols:
+        threading.Thread(target=lambda: asyncio.run(websocket_listener("binance", symbol)), daemon=True).start()
+        threading.Thread(target=lambda: asyncio.run(websocket_listener("kucoin", symbol)), daemon=True).start()
+        threading.Thread(target=lambda: asyncio.run(websocket_listener("okx", symbol)), daemon=True).start()
+
+    # Blockchain Verisi Çekme & The Graph API Kullanımı
+    while True:
+        block_data = get_blockchain_data()
+        graph_data = get_graph_data()
+        
+        if block_data:
+            logging.info(f"✅ Blok No: {block_data['number']}, İşlemler: {len(block_data['transactions'])}")
+        
+        if graph_data:
+            logging.info(f"✅ The Graph API Verileri: {graph_data}")
+
+        time.sleep(60)  # Her dakika veri çek
