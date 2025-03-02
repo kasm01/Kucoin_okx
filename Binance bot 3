@@ -1,0 +1,143 @@
+import os
+import logging
+import time
+import numpy as np
+import pandas as pd
+import threading
+import asyncio
+import requests
+import websockets
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from dotenv import load_dotenv
+from binance.client import Client
+from kucoin.client import Client as KucoinClient
+from okx import MarketData, Trade
+from web3 import Web3
+from sklearn.preprocessing import MinMaxScaler
+from stable_baselines3 import PPO, DQN
+import gym
+
+# 📌 API Anahtarlarını Güvenli Şekilde Yükle
+load_dotenv()
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+KUCOIN_API_KEY = os.getenv("KUCOIN_API_KEY")
+KUCOIN_API_SECRET = os.getenv("KUCOIN_API_SECRET")
+OKX_API_KEY = os.getenv("OKX_API_KEY")
+OKX_API_SECRET = os.getenv("OKX_API_SECRET")
+INFURA_API_KEY = os.getenv("INFURA_API_KEY")
+ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
+THE_GRAPH_API_KEY = os.getenv("THE_GRAPH_API_KEY")
+
+# 📌 Binance, KuCoin ve OKX Bağlantıları
+binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+kucoin_client = KucoinClient(KUCOIN_API_KEY, KUCOIN_API_SECRET)
+okx_market = MarketData(OKX_API_KEY, OKX_API_SECRET)
+okx_trade = Trade(OKX_API_KEY, OKX_API_SECRET)
+
+# 📌 Blockchain API Bağlantıları
+w3 = Web3(Web3.HTTPProvider(f"https://mainnet.infura.io/v3/{INFURA_API_KEY}"))
+
+# 📌 AI Modeli: LSTM + Transformers
+class AITradingModel(nn.Module):
+    def __init__(self, input_size=5, hidden_layer_size=64, output_size=1):
+        super().__init__()
+        self.hidden_layer_size = hidden_layer_size
+        self.lstm = nn.LSTM(input_size, hidden_layer_size, batch_first=True)
+        self.transformer = nn.Transformer(d_model=hidden_layer_size, nhead=8, num_encoder_layers=2)
+        self.linear = nn.Linear(hidden_layer_size, output_size)
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        transformer_out = self.transformer(lstm_out, lstm_out)
+        predictions = self.linear(transformer_out[:, -1])
+        return predictions
+
+# 📌 Reinforcement Learning: PPO & DQN
+def train_rl_model():
+    env = gym.make("TradingEnv-v1")
+    model = PPO("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=100000)
+    return model
+
+# 📌 Market Verisi Çekme
+def get_market_data():
+    url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+    response = requests.get(url).json()
+    return float(response["price"])
+
+# 📌 Order Book Analizi
+def analyze_order_book(symbol):
+    order_book = binance_client.get_order_book(symbol=symbol, limit=100)
+    bid_volumes = np.array([float(order[1]) for order in order_book["bids"]])
+    ask_volumes = np.array([float(order[1]) for order in order_book["asks"]])
+    imbalance = (bid_volumes.sum() - ask_volumes.sum()) / (bid_volumes.sum() + ask_volumes.sum())
+    return imbalance
+
+# 📌 PnL & Hedge Mekanizması
+def calculate_stop_loss(pnl, balance, leverage):
+    return 0.015 * (1 + np.clip(abs(pnl) / balance, 0, 1) * leverage)
+
+def check_liquidation_risk(position_price, liquidation_price):
+    if abs(position_price - liquidation_price) / liquidation_price < 0.05:
+        logging.warning("⚠️ Likidasyon riski yaklaştı, hedge işlemi açılıyor!")
+        return "HEDGE"
+    return "SAFE"
+
+# 📌 Haber & Duygu Analizi
+def get_sentiment_analysis():
+    url = "https://newsapi.org/v2/everything?q=crypto&apiKey=YOUR_NEWSAPI_KEY"
+    response = requests.get(url).json()
+    sentiment_scores = [1 if "bullish" in article["title"] else -1 for article in response["articles"]]
+    return np.mean(sentiment_scores)
+
+# 📌 On-Chain Balina Takibi
+def get_whale_transactions():
+    url = f"https://api.santiment.net/graphql"
+    query = {"query": "{ ethereum { transfers(first: 10) { from to amount } } }"}
+    headers = {"Authorization": f"Bearer YOUR_SANTIMENT_API_KEY"}
+    response = requests.post(url, json=query, headers=headers).json()
+    whale_moves = response["data"]["ethereum"]["transfers"]
+    return whale_moves
+
+# 📌 WebSocket ile Gerçek Zamanlı Veri Akışı
+async def websocket_listener(symbol):
+    uri = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@trade"
+    async with websockets.connect(uri) as websocket:
+        while True:
+            message = await websocket.recv()
+            print(f"📡 {symbol}: {message}")
+
+# 📌 Trade Kararı Verme
+def decide_trade():
+    market_data = get_market_data()
+    order_book_imbalance = analyze_order_book("BTCUSDT")
+    sentiment = get_sentiment_analysis()
+    whale_activity = get_whale_transactions()
+    
+    if sentiment > 0 and order_book_imbalance > 0.2:
+        return "BUY"
+    elif sentiment < 0 and order_book_imbalance < -0.2:
+        return "SELL"
+    return "HOLD"
+
+# 📌 Ana Çalıştırma
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    # WebSocket Bağlantıları
+    threading.Thread(target=lambda: asyncio.run(websocket_listener("BTCUSDT")), daemon=True).start()
+
+    # Trade Kararı
+    while True:
+        trade_signal = decide_trade()
+        if trade_signal == "BUY":
+            print("🚀 Alım sinyali tespit edildi!")
+        elif trade_signal == "SELL":
+            print("📉 Satış sinyali tespit edildi!")
+        else:
+            print("⏳ Beklemede...")
+
+        time.sleep(60)  # 1 dakika sonra tekrar kontrol et
